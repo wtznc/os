@@ -273,3 +273,298 @@ llvm-nm kernel.elf | grep _     # look up symbols like __bss, __bss_end, __stack
 - **Other kernels** to compare against:
   - [xv6-riscv `kernel.ld`](https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/kernel.ld) — short and very readable.
   - [Linux `vmlinux.lds.S`](https://github.com/torvalds/linux/blob/master/arch/riscv/kernel/vmlinux.lds.S) — production-grade, useful once the basics click.
+
+
+## Minimal kernel
+
+Now that the linker script has decided *where* things live in memory, we need a tiny bit of C code to put *something* at those addresses. The minimal kernel does just three things:
+
+1. Run at the entry address OpenSBI jumps to.
+2. Set up a stack pointer.
+3. Hand off to a regular C function and loop forever.
+
+That's it — no drivers, no printing, no syscalls yet. Just enough to prove the boot path works.
+
+### The whole file
+
+```c
+typedef unsigned char uint8_t;
+typedef unsigned int  uint32_t;
+typedef uint32_t      size_t;
+
+extern char __bss[], __bss_end[], __stack_top[];
+
+void *memset(void *buf, char c, size_t n) {
+    uint8_t *p = (uint8_t *)buf;
+    while (n--) *p++ = c;
+    return buf;
+}
+
+void kernel_main() {
+    memset(__bss, 0, (size_t)__bss_end - (size_t)__bss);
+    for (;;) ;
+}
+
+__attribute__((section(".text.boot")))
+__attribute__((naked))
+void boot(void) {
+    __asm__ __volatile__(
+        "mv sp, %[stack_top]\n"
+        "j kernel_main\n"
+        :
+        : [stack_top] "r"(__stack_top)
+    );
+}
+```
+
+That's the whole kernel for now. Let's walk through each piece.
+
+### Typedefs — no libc
+
+```c
+typedef unsigned char uint8_t;
+typedef unsigned int  uint32_t;
+typedef uint32_t      size_t;
+```
+
+In a normal C program we'd `#include <stdint.h>` and get `uint8_t` and friends for free. But we're bare-metal: there is no standard library to include from. We're writing it. So we define the few types we need by hand.
+
+The sizes assume rv32: `int` is 32 bits, `char` is 8 bits, `size_t` is 32 bits (the natural pointer/index size on a 32-bit machine).
+
+### Linker symbols — the bridge to `kernel.ld`
+
+```c
+extern char __bss[], __bss_end[], __stack_top[];
+```
+
+These three names don't refer to anything declared in C. They come from the **linker script**. Look back at `kernel.ld`:
+
+```ld
+.bss : ALIGN(4) {
+    __bss = .;
+    *(.bss .bss.* .sbss .sbss.*);
+    __bss_end = .;
+}
+. = ALIGN(4);
+. += 128 * 1024;
+__stack_top = .;
+```
+
+Each `name = .;` defines a symbol whose *value is an address* — the current value of the location counter at that point in the layout. The linker patches those addresses into the final ELF, and the C code can refer to them through `extern` declarations.
+
+Why declare them as `char[]`? Because we only care about the **address**, not any value supposedly stored there. An array name decays to a pointer (`__bss` → `char *` pointing at the first byte of `.bss`), which is exactly what `memset` and pointer arithmetic want. Declaring `extern char __bss;` would also work but would force us to write `&__bss` every time.
+
+### `memset` — also no libc
+
+```c
+void *memset(void *buf, char c, size_t n) {
+    uint8_t *p = (uint8_t *)buf;
+    while (n--) *p++ = c;
+    return buf;
+}
+```
+
+A byte-by-byte fill. We need it to zero out `.bss`. The signature matches the standard libc one so we could later swap in a faster implementation without touching callers.
+
+### `kernel_main` — the C-level entry point
+
+```c
+void kernel_main() {
+    memset(__bss, 0, (size_t)__bss_end - (size_t)__bss);
+    for (;;) ;
+}
+```
+
+By the time we reach `kernel_main`, the `boot` function below has already set up a valid stack. From here on we can write normal C — locals, function calls, everything.
+
+The first job is to **zero the `.bss` region**. Why? The C standard promises that uninitialised globals start at 0. On a hosted system (Linux, macOS) the program loader fills `.bss` with zeros before `main` runs. On bare-metal there is no loader — the kernel image is dropped into RAM with `.bss` full of garbage. We satisfy the C contract ourselves, using the bounds the linker script gave us.
+
+Then we spin forever. Returning from `kernel_main` would have nowhere to go: nothing called us (the boot code *jumped* in without saving a return address), so returning would pop a garbage value from `ra` and jump to who-knows-where.
+
+### `boot` — the very first instruction
+
+```c
+__attribute__((section(".text.boot")))
+__attribute__((naked))
+void boot(void) {
+    __asm__ __volatile__(
+        "mv sp, %[stack_top]\n"
+        "j kernel_main\n"
+        :
+        : [stack_top] "r"(__stack_top)
+    );
+}
+```
+
+This is what OpenSBI jumps to. Two attributes do most of the work.
+
+**`__attribute__((section(".text.boot")))`** puts this function into a separate input section called `.text.boot`. Remember the linker script:
+
+```ld
+.text : {
+    KEEP(*(.text.boot));    /* <-- our boot() lands here, FIRST */
+    *(.text .text.*);
+}
+```
+
+Because `.text.boot` is listed first inside `.text`, and `.text` is the very first section at `0x80200000`, the function `boot` ends up at exactly `0x80200000` — the address OpenSBI hands control to. `KEEP(...)` is what stops the linker from garbage-collecting it: no other C code calls `boot()`, so without `KEEP` the linker would think it's dead code.
+
+**`__attribute__((naked))`** tells the compiler: *don't generate a prologue or epilogue*. A normal C function starts with code like `addi sp, sp, -16; sw ra, 12(sp)` to save registers on the stack. But at this point **there is no stack yet** — `sp` contains whatever OpenSBI left in it. Any prologue would crash. With `naked`, the body is *only* our inline assembly — nothing before, nothing after.
+
+The body is two instructions:
+
+| Instruction              | What it does                                                |
+| ------------------------ | ----------------------------------------------------------- |
+| `mv sp, %[stack_top]`    | Set the stack pointer to `__stack_top` (top of the 128 KB stack the linker reserved). Now C function calls have somewhere to put their frames. |
+| `j kernel_main`          | Unconditional jump to `kernel_main`. We use `j`, not `jal`, because we never plan to return — there's no caller to return to. |
+
+The constraint `[stack_top] "r"(__stack_top)` is GCC inline-asm syntax for: *"take the address `__stack_top`, put it into some general-purpose register the compiler picks, and substitute the register name wherever I wrote `%[stack_top]`"*. We don't care which register — the compiler decides.
+
+### The handoff, end to end
+
+Putting it all together, here's what happens when you run `./run.sh`:
+
+```
+QEMU launches qemu-system-riscv32
+   │
+   ▼
+OpenSBI loads at 0x80000000, initialises hardware
+   │
+   ▼  jump to Domain0 Next Address = 0x80200000
+boot()  (in .text.boot at 0x80200000)
+   │   mv sp, __stack_top      ← sp now points at the top of our 128 KB stack
+   ▼   j kernel_main
+kernel_main()
+   │   memset(__bss, 0, __bss_end - __bss)   ← C globals are now valid
+   ▼
+for (;;) ;                                   ← park forever
+```
+
+Three files cooperate to make that picture work:
+
+- **`run.sh`** picks the right machine and firmware (`-machine virt -bios default`).
+- **`kernel.ld`** decides where each section lives and exposes `__bss`, `__bss_end`, `__stack_top` as symbols.
+- **`kernel.c`** consumes those symbols, sets up the stack, and starts running C code.
+
+### Inspecting it
+
+After building, you can confirm everything landed where it should:
+
+```sh
+llvm-readelf -h kernel.elf | grep Entry        # Entry point should be 0x80200000
+llvm-objdump -d kernel.elf | head -20          # First disassembled instructions are boot's `mv` and `j`
+llvm-nm kernel.elf | grep -E '__bss|__stack'   # See __bss, __bss_end, __stack_top with concrete addresses
+```
+
+If those line up, the boot path is wired correctly — anything else you build on top (printing, traps, syscalls) just adds code; the foundation is already in place.
+
+---
+
+## Build & run pipeline
+
+So far we've looked at *what* the linker script lays out and *what* the C code does. The missing piece is the toolchain that turns source files into a running kernel. That's what `run.sh` automates.
+
+### The big picture
+
+```
+  kernel.c ──┐
+             │  clang (compiler driver)
+  kernel.ld ─┤      ├── cc1: kernel.c → object code
+             │      └── ld.lld: link with kernel.ld → kernel.elf
+             │
+             ▼
+        kernel.elf  ──── qemu-system-riscv32 -kernel kernel.elf
+                         │
+                         ▼
+                    OpenSBI (firmware) → boot() → kernel_main()
+```
+
+Two stages: **build** (host-side, produces `kernel.elf`) and **run** (QEMU loads the ELF and starts emulating).
+
+### Stage 1: Build
+
+The single line that does everything:
+
+```sh
+clang $CFLAGS -Wl,-Tkernel.ld -Wl,-Map=kernel.map -o kernel.elf kernel.c
+```
+
+Clang acts as a *driver*: it compiles `kernel.c` to an object file in memory, then invokes the linker (`ld.lld`) to combine that object with our linker script into a final ELF. The `-Wl,` prefix tells clang "pass this flag straight to the linker".
+
+Why each flag matters (full per-flag explanations live in [`run.sh`](../run.sh) — short version here):
+
+| Flag                              | Job                                                                        |
+| --------------------------------- | -------------------------------------------------------------------------- |
+| `--target=riscv32-unknown-elf`    | Cross-compile for 32-bit RISC-V (bare-metal ELF), not the host machine.    |
+| `-ffreestanding -nostdlib`        | We're not a hosted program; don't assume or link libc or crt startup files.|
+| `-fno-stack-protector`            | Disable stack canaries — they call into libc, which we don't have.         |
+| `-fuse-ld=lld`                    | Use LLVM's linker, which understands our linker script.                    |
+| `-Wl,-Tkernel.ld`                 | Use `kernel.ld` as the linker script (overrides ld's default).             |
+| `-Wl,-Map=kernel.map`             | Emit a map file listing where every symbol landed — useful for debugging.  |
+| `-O2 -g3 -Wall -Wextra`           | Standard "reasonably optimised, fully debuggable, complain about mistakes".|
+
+The output is `kernel.elf` — an ELF binary whose entry point is `0x80200000` (set by `ENTRY(boot)` + `. = 0x80200000;` in the linker script).
+
+### Stage 2: Run
+
+```sh
+qemu-system-riscv32 \
+    -machine virt -bios default -nographic \
+    -serial mon:stdio --no-reboot \
+    -kernel kernel.elf
+```
+
+What each flag does:
+
+| Flag                  | Job                                                                                 |
+| --------------------- | ----------------------------------------------------------------------------------- |
+| `-machine virt`       | Emulate the generic RISC-V `virt` board (the synthetic one QEMU ships for OS dev).  |
+| `-bios default`       | Use QEMU's bundled OpenSBI as firmware.                                             |
+| `-nographic`          | No graphical window; run entirely in the terminal.                                  |
+| `-serial mon:stdio`   | Pipe the guest UART (and the QEMU monitor) through the host stdio.                  |
+| `--no-reboot`         | If the guest tries to reboot, exit instead of looping.                              |
+| `-kernel kernel.elf`  | **Load our ELF as the guest kernel and have OpenSBI jump into it.** (Key link!)     |
+
+The crucial one is `-kernel kernel.elf`. QEMU parses the ELF, copies each loadable segment to the physical address the linker script asked for (so `.text` lands at `0x80200000`, and so on), and then arranges for OpenSBI to jump there in S-mode after firmware initialisation finishes. Without it, OpenSBI would boot, print its banner, and then have nowhere to go.
+
+### How the three files connect
+
+Each file does one job, and they meet up at well-known addresses and symbols:
+
+| File         | Produces                                | Consumed by                                                                             |
+| ------------ | --------------------------------------- | --------------------------------------------------------------------------------------- |
+| `kernel.c`   | code & data, the `boot` symbol          | The linker (via clang) — turned into bytes inside `kernel.elf`.                          |
+| `kernel.ld`  | section layout, `__bss`, `__bss_end`, `__stack_top` | The linker — controls where bytes go. The C code reads its symbols via `extern`. |
+| `run.sh`     | the build command + QEMU command line   | You — `./run.sh` is the only thing you ever run by hand.                                |
+
+If you change any one of these you usually have to think about the other two:
+
+- Move the kernel base address in `kernel.ld`? Make sure OpenSBI's `Domain0 Next Address` still matches.
+- Add a new section to `kernel.ld`? The linker will complain unless something puts data into it.
+- Change `boot` to a different name? Update `ENTRY(...)` in `kernel.ld` to match.
+
+### End-to-end timeline
+
+```
+./run.sh
+   │
+   ├─► clang --target=riscv32-unknown-elf ... -Wl,-Tkernel.ld ... kernel.c
+   │       └── produces kernel.elf  (entry = 0x80200000)
+   │
+   └─► qemu-system-riscv32 -machine virt -bios default ... -kernel kernel.elf
+           │
+           ├── OpenSBI loads at 0x80000000, prints banner
+           ├── OpenSBI copies kernel.elf segments to their target addresses
+           ├── OpenSBI jumps to 0x80200000 in S-mode
+           │
+           └── boot()         (.text.boot, at 0x80200000)
+                 │   mv sp, __stack_top
+                 │   j kernel_main
+                 ▼
+               kernel_main()
+                 │   memset(__bss, 0, __bss_end - __bss)
+                 ▼
+               for (;;) ;
+```
+
+Once this whole chain runs cleanly, you have a working bare-metal RISC-V kernel that does nothing — but is ready to do anything.

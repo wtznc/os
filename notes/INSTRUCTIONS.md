@@ -91,6 +91,24 @@ Jumps back to the address stored in `ra`. Equivalent to `jalr x0, 0(ra)`.
 ret                // pc = ra
 ```
 
+### End-to-end example
+
+Translating `int result = func(123);` where `func(a)` returns `a + 1`:
+
+```asm
+// caller
+li  a0, 123          // a0 = 123          ← argument
+jal ra, func         // call func; ra = return address
+// a0 now holds the return value (124)
+
+// callee
+func:
+    addi a0, a0, 1   // a0 += 1
+    ret              // return; result already in a0
+```
+
+Convention: arguments go in `a0`–`a7`, return value comes back in `a0`, return address lives in `ra`.
+
 ---
 
 ## Stack operations

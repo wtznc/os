@@ -6,6 +6,7 @@ Study notes that go with this repo live in [`notes/`](./notes):
 
 - [`notes/RISC-V 101.md`](./notes/RISC-V%20101.md) — primer on the 32-bit RISC-V ISA: assembly basics, registers, memory access, branches, function calls, and the stack.
 - [`notes/INSTRUCTIONS.md`](./notes/INSTRUCTIONS.md) — concise reference of the RISC-V instructions used throughout the project, grouped by purpose (arithmetic, memory, branches, function calls, stack).
+- [`notes/BOOT.md`](./notes/BOOT.md) — what happens before the kernel runs: OpenSBI / SBI, example QEMU boot output, monitor shortcuts, and the linker script.
 
 ## Later:
 1. `lld` deepdive

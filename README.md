@@ -3,7 +3,9 @@
 ## Later:
 1. `lld` deepdive
 2. `qemu` deepdive
-3. `riscv64` instead of `riscv32`
+3.  try `riscv64` instead of `riscv32`
+4. what are the all instructions in `riscv32`? (see `llvm-objdump -d` output)
+5. what are all the registers in `riscv32`? (see `llvm-objdump -d` output)
 
 ## Tools:
 - `clang` - C compiler, needs support for 32-bit RISC-V CPU
@@ -12,6 +14,8 @@
 - `llvm-objdump` - A disassembler, comes with the `llvm` package
 - `llvm-readelf` - An ELF file reader, comes with the `llvm` package
 - `qemu-system-riscv32` - 32-bit RISC-V CPU emulator, it's part of `qemu` package
+- [Compiler Explorer](https://godbolt.org) - useful tool for learning assembly, as I type C code it shows the corresponding assembly code. By default it uses x86-64 CPU assembly. Specify `RISC-V rv32gc clang (trunk)` in the right pane to output 32-bit RISC-V assembly.
+    - also we can specify options like `-O0` (optimization off) or `-O2` (optimization on) to see how the assembly code changes.
 
 ## Setup (macOS)
 
@@ -66,5 +70,13 @@ export PATH="$(brew --prefix llvm)/bin:$PATH"
 ```sh
 ./run.sh
 ```
+## QEMU `virt` machine
 
-QEMU console: `Ctrl-A` then `c`; type `quit` to exit.
+Even though it does not exist in the real world, it's simple and very similar to real devices. I can emulate on it for free, no need to buy a physical hardware. When I encounter debugging issues, I can read QEMU's source code, or attach a debugger to the QEMU process to investigate what's wrong.
+
+[QEMU documentation](https://www.qemu.org/docs/master/system/riscv/virt.html)
+
+QEMU console: 
+`Ctrl-A` then `c`; type `quit` to exit.
+
+
